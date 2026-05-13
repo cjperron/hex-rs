@@ -4,7 +4,7 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use hex_rs::{Agent, AppConfig, AppState, HexCell, ClickAgent, GameUpdate, HexBoard, HexMove, Player};
+use hex_rs::{Agent, AppConfig, AppState, HexCell, ClickAgent, RandomAgent, GameUpdate, HexBoard, HexMove, Player};
 use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Rect},
@@ -75,8 +75,23 @@ fn rect_contains(rect: Rect, col: u16, row: u16) -> bool {
     col >= rect.x && col < rect.x + rect.width && row >= rect.y && row < rect.y + rect.height
 }
 
+type AgentFactory = fn(std::sync::Arc<std::sync::Mutex<Receiver<HexMove>>>) -> Box<dyn Agent>;
+
+fn create_human_agent(rx: std::sync::Arc<std::sync::Mutex<Receiver<HexMove>>>) -> Box<dyn Agent> {
+    Box::new(ClickAgent::new(rx))
+}
+
+fn create_random_agent(_rx: std::sync::Arc<std::sync::Mutex<Receiver<HexMove>>>) -> Box<dyn Agent> {
+    Box::new(RandomAgent::new())
+}
+
+const AVAILABLE_AGENTS: &[(&str, AgentFactory)] = &[
+    ("Human", create_human_agent),
+    ("Random", create_random_agent),
+];
+
 fn dropdown_max(selected: usize) -> usize {
-    match selected { 0 | 1 => 27, _ => 1 }
+    match selected { 0 | 1 => 27, 4 | 5 => AVAILABLE_AGENTS.len().saturating_sub(1), _ => 1 }
 }
 
 fn dropdown_options(selected: usize) -> Vec<ListItem<'static>> {
@@ -84,6 +99,7 @@ fn dropdown_options(selected: usize) -> Vec<ListItem<'static>> {
         0 | 1 => (3usize..=30).map(|v| ListItem::new(format!("  {}  ", v))).collect(),
         2     => vec![ListItem::new("  Enabled  "), ListItem::new("  Disabled  ")],
         3     => vec![ListItem::new("  Red  "), ListItem::new("  Blue  ")],
+        4 | 5 => AVAILABLE_AGENTS.iter().map(|(name, _)| ListItem::new(format!("  {}  ", name))).collect(),
         _     => vec![],
     }
 }
@@ -94,6 +110,8 @@ fn config_to_dropdown_idx(config: &AppConfig, selected: usize) -> usize {
         1 => config.height.saturating_sub(3),
         2 => if config.swap_rule { 0 } else { 1 },
         3 => if config.first_player == Player::Red { 0 } else { 1 },
+        4 => AVAILABLE_AGENTS.iter().position(|&(n, _)| n == config.agent1).unwrap_or(0),
+        5 => AVAILABLE_AGENTS.iter().position(|&(n, _)| n == config.agent2).unwrap_or(0),
         _ => 0,
     }
 }
@@ -104,6 +122,8 @@ fn apply_dropdown_selection(config: &mut AppConfig, selected: usize, idx: usize)
         1 => config.height = idx + 3,
         2 => config.swap_rule = idx == 0,
         3 => config.first_player = if idx == 0 { Player::Red } else { Player::Blue },
+        4 => if let Some(&(name, _)) = AVAILABLE_AGENTS.get(idx) { config.agent1 = name.to_string(); },
+        5 => if let Some(&(name, _)) = AVAILABLE_AGENTS.get(idx) { config.agent2 = name.to_string(); },
         _ => {}
     }
     config.save();
@@ -123,14 +143,17 @@ fn menu_rects(size: Rect) -> (Rect, Rect) {
 
 // ── Game thread ──────────────────────────────────────────────────────────────
 
-fn spawn_game_thread(board: HexBoard, move_rx: Receiver<HexMove>, update_tx: Sender<GameUpdate>) {
+fn spawn_game_thread(board: HexBoard, mut agent1: Box<dyn Agent>, mut agent2: Box<dyn Agent>, update_tx: Sender<GameUpdate>) {
     thread::spawn(move || {
         let mut b = board;
-        let mut agent = ClickAgent::new(move_rx);
         let _ = update_tx.send(GameUpdate::State(b.clone()));
         loop {
             if b.winner.is_some() { break; }
-            let action = agent.get_move(&b);
+            let action = if b.current_player == Player::Red {
+                agent1.get_move(&b)
+            } else {
+                agent2.get_move(&b)
+            };
             match b.apply_move(&action) {
                 Ok(_)  => { if update_tx.send(GameUpdate::State(b.clone())).is_err() { break; } }
                 Err(e) => { if update_tx.send(GameUpdate::Error(e)).is_err() { break; } }
@@ -139,11 +162,26 @@ fn spawn_game_thread(board: HexBoard, move_rx: Receiver<HexMove>, update_tx: Sen
     });
 }
 
+fn create_agent(name: &str, agent_rx: std::sync::Arc<std::sync::Mutex<Receiver<HexMove>>>) -> Box<dyn Agent> {
+    for &(agent_name, factory) in AVAILABLE_AGENTS {
+        if agent_name == name {
+            return factory(agent_rx);
+        }
+    }
+    // Default fallback
+    AVAILABLE_AGENTS[0].1(agent_rx)
+}
+
 fn launch_game(config: &AppConfig) -> (HexBoard, Sender<HexMove>, Receiver<GameUpdate>) {
     let (ui_tx, agent_rx) = mpsc::channel::<HexMove>();
     let (game_tx, ui_rx) = mpsc::channel::<GameUpdate>();
     let board = HexBoard::new(config.width, config.height, config.first_player, config.swap_rule);
-    spawn_game_thread(board.clone(), agent_rx, game_tx);
+    let rx_arc = std::sync::Arc::new(std::sync::Mutex::new(agent_rx));
+    
+    let agent1 = create_agent(&config.agent1, rx_arc.clone());
+    let agent2 = create_agent(&config.agent2, rx_arc);
+    
+    spawn_game_thread(board.clone(), agent1, agent2, game_tx);
     (board, ui_tx, ui_rx)
 }
 
@@ -155,14 +193,16 @@ fn build_menu_list_items(config: &AppConfig, menu: &MenuState) -> Vec<ListItem<'
         format!("{:15} [ {} ▼ ]",   "Board Height:", config.height),
         format!("{:15} [ {} ▼ ]",   "Swap Rule:",    if config.swap_rule { "Enabled" } else { "Disabled" }),
         format!("{:15} [ {:?} ▼ ]", "First Player:", config.first_player),
+        format!("{:15} [ {} ▼ ]",   "Red Agent:",    config.agent1),
+        format!("{:15} [ {} ▼ ]",   "Blue Agent:",   config.agent2),
         String::new(),
         "  [ Reset to Defaults ]".to_string(),
         "  [ Start Game ]".to_string(),
     ];
 
     items.into_iter().enumerate().map(|(i, text)| {
-        if i == 4 { return ListItem::new(""); }
-        let state_idx = if i > 4 { i - 1 } else { i };
+        if i == 6 { return ListItem::new(""); }
+        let state_idx = if i > 6 { i - 1 } else { i };
         let style = match (state_idx == menu.selected, menu.dropdown_open) {
             (true, false) => Style::default().bg(Color::DarkGray).fg(Color::White).add_modifier(Modifier::BOLD),
             (true, true)  => Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
@@ -414,9 +454,9 @@ fn handle_dropdown_key(key: KeyEvent, config: &mut AppConfig, menu: &mut MenuSta
 
 fn handle_menu_enter(config: &mut AppConfig, menu: &mut MenuState) -> Option<MenuAction> {
     match menu.selected {
-        0..=3 => menu.open_dropdown(config),
-        4 => { *config = AppConfig::default(); config.save(); }
-        5 => return Some(MenuAction::StartGame),
+        0..=5 => menu.open_dropdown(config),
+        6 => { *config = AppConfig::default(); config.save(); }
+        7 => return Some(MenuAction::StartGame),
         _ => {}
     }
     None
@@ -429,8 +469,8 @@ fn handle_menu_key(key: KeyEvent, config: &mut AppConfig, menu: &mut MenuState) 
     }
     match key.code {
         KeyCode::Char('q') | KeyCode::Esc => Some(MenuAction::Quit),
-        KeyCode::Down  => { menu.selected = if menu.selected >= 5 { 0 } else { menu.selected + 1 }; None }
-        KeyCode::Up    => { menu.selected = if menu.selected == 0 { 5 } else { menu.selected - 1 }; None }
+        KeyCode::Down  => { menu.selected = if menu.selected >= 7 { 0 } else { menu.selected + 1 }; None }
+        KeyCode::Up    => { menu.selected = if menu.selected == 0 { 7 } else { menu.selected - 1 }; None }
         KeyCode::Enter => handle_menu_enter(config, menu),
         _ => None,
     }
@@ -449,7 +489,7 @@ fn handle_dropdown_click(mx: u16, my: u16, config: &mut AppConfig, menu: &mut Me
     if my < inner_y || my >= inner_bot { return; }
 
     let clicked_idx = (my - inner_y) as usize + menu.dropdown_list.offset();
-    let max_items   = match menu.selected { 0 | 1 => 28, _ => 2 };
+    let max_items   = match menu.selected { 0 | 1 => 28, 4 | 5 => AVAILABLE_AGENTS.len(), _ => 2 };
 
     if clicked_idx < max_items {
         menu.dropdown_list.select(Some(clicked_idx));
@@ -465,7 +505,7 @@ fn handle_menu_click(mx: u16, my: u16, config: &mut AppConfig, menu: &mut MenuSt
     }
     if !rect_contains(inner, mx, my) { return None; }
 
-    let visual_to_state: [Option<usize>; 7] = [Some(0), Some(1), Some(2), Some(3), None, Some(4), Some(5)];
+    let visual_to_state: [Option<usize>; 9] = [Some(0), Some(1), Some(2), Some(3), Some(4), Some(5), None, Some(6), Some(7)];
     let Some(Some(target)) = visual_to_state.get((my - inner.y) as usize) else { return None; };
     menu.selected = *target;
     handle_menu_enter(config, menu)
@@ -653,7 +693,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if let Some(rx) = &ui_rx {
                     while let Ok(update) = rx.try_recv() {
                         match update {
-                            GameUpdate::State(b) => current_board = b,
+                            GameUpdate::State(b) => {
+                                current_board = b;
+                                error_msg = String::new();
+                            },
                             GameUpdate::Error(e) => error_msg = e,
                         }
                     }
@@ -689,13 +732,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         cursor_x = x;
                         cursor_y = y;
                         let candidate = HexMove { x, y };
-                        if current_board.is_valid_move(&candidate) {
-                            if let Some(tx) = &ui_tx {
-                                let _ = tx.send(candidate);
-                                error_msg = String::new();
-                            }
-                        } else {
-                            error_msg = format!("UI WARNING: Invalid move: {}", candidate);
+                        if let Some(tx) = &ui_tx {
+                            let _ = tx.send(candidate);
                         }
                     }
                 }

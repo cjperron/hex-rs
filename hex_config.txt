@@ -2,3 +2,5 @@ width=11
 height=11
 swap_rule=false
 first_player=Red
+agent1=Human
+agent2=Random

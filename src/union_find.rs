@@ -1,4 +1,5 @@
 // --- Union-Find ---
+#[derive(Debug, Clone)]
 pub struct UnionFind {
     parent: Vec<usize>,
     rank: Vec<usize>,
