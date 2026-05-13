@@ -11,6 +11,12 @@ impl RandomAgent {
     }
 }
 
+impl Default for RandomAgent{
+    fn default() -> Self {
+        Self
+    }
+}
+
 impl Agent for RandomAgent {
     fn get_move(&mut self, board: &HexBoard) -> HexMove {
         let mut valid_moves = Vec::new();
